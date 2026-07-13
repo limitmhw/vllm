@@ -758,14 +758,8 @@ class QuarkConfig(QuantizationConfig):
             ".qscales": ".weight_scale",
             ".qqzeros": ".weight_zero_point",
         }
-        regex_map: dict[re.Pattern[str], str | None] = {
-            re.compile(r"\.shared_expert_gate\.weight_scale$"): None,
-            re.compile(r"\.shared_expert_gate\.weight_zero_point$"): None,
-        }
-
         return WeightsMapper(
             orig_to_new_suffix=suffix_map,
-            orig_to_new_regex=regex_map,
         )
 
     def get_cache_scale_mapper(self) -> "WeightsMapper":

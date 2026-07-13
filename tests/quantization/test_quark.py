@@ -669,6 +669,45 @@ class TestQuarkInt4Format:
         assert "layers.0.mlp.gate.weight" in output_names
         assert "layers.1.mlp.gate.weight" in output_names
 
+    def test_quark_shared_expert_gate_keeps_quantized_tensors(self):
+        quant_config = QuarkConfig.from_config(_quark_int4_config())
+        mapper = quant_config.get_cache_scale_mapper()
+
+        output_names = {
+            name
+            for name, _ in mapper.apply(
+                [
+                    (
+                        "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+                        torch.zeros(1),
+                    ),
+                    (
+                        "model.language_model.layers.0.mlp.shared_expert_gate"
+                        ".weight_scale",
+                        torch.zeros(1),
+                    ),
+                    (
+                        "model.language_model.layers.0.mlp.shared_expert_gate"
+                        ".weight_zero_point",
+                        torch.zeros(1),
+                    ),
+                ]
+            )
+        }
+
+        assert (
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight"
+            in output_names
+        )
+        assert (
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight_scale"
+            in output_names
+        )
+        assert (
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight_zero_point"
+            in output_names
+        )
+
     def test_quark_projection_weights_keep_native_names(self):
         quant_config = QuarkConfig.from_config(
             _quark_int4_config(exclude=["layers.0.mlp.shared_expert.down_proj"])

@@ -47,9 +47,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.layers.quantization.quark.utils import (
-    dequantize_quark_shared_expert_gate_weights,
-)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -371,9 +368,7 @@ class Qwen3_5ForCausalLMBase(
             self,
             skip_prefixes=skip_prefixes,
         )
-        return loader.load_weights(
-            dequantize_quark_shared_expert_gate_weights(weights)
-        )
+        return loader.load_weights(weights)
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
@@ -525,10 +520,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self,
             skip_prefixes=skip_prefixes,
         )
-        return loader.load_weights(
-            dequantize_quark_shared_expert_gate_weights(weights),
-            mapper=mapper,
-        )
+        return loader.load_weights(weights, mapper=mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

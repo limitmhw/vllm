@@ -42,9 +42,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.quark.utils import (
-    dequantize_quark_shared_expert_gate_weights,
-)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -150,7 +147,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             config.hidden_size,
             1,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.shared_expert_gate",
         )
 
@@ -641,7 +638,6 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
             )
         loader = AutoWeightsLoader(self)
-        weights = dequantize_quark_shared_expert_gate_weights(weights)
         return loader.load_weights(weights, mapper=mapper)
 
 
