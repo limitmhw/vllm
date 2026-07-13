@@ -24,8 +24,10 @@ from vllm.model_executor.layers.quantization.quark.quark import (  # noqa: E501
     QuarkW8A8Int8,
 )
 from vllm.model_executor.layers.quantization.quark.quark_moe import (  # noqa: E501
+    QuarkW4A16Int4MoEMethod,
     QuarkW8A8Int8MoEMethod,
 )
+from vllm.model_executor.layers.quantization.quark.schemes import QuarkW4A16Int4
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
@@ -602,15 +604,30 @@ def _dequantize_quark_signed_awq_torch(
 class TestQuarkInt4Format:
     """Tests for Quark INT4 export format compatibility."""
 
-    def test_quark_order_pack_method_sets_pack_reorder_false(self):
+    def test_quark_order_pack_method_uses_native_int4_scheme(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config(pack_method="order"))
+        scheme = quant_config._get_scheme_from_config(
+            quant_config.quant_config["global_quant_config"]
+        )
 
-        assert quant_config.awq_config is not None
-        assert quant_config.awq_config.signed_int4
-        assert not quant_config.awq_config.pack_reorder
-        assert quant_config.awq_config.lm_head_quantized
+        assert isinstance(scheme, QuarkW4A16Int4)
+        assert not scheme.pack_reorder
 
-    def test_quark_excluded_lm_head_is_not_remapped_to_qweight(self):
+    def test_quark_int4_moe_uses_native_moe_method(self):
+        quant_config = QuarkConfig.from_config(_quark_int4_config())
+        moe_config = type("MoeConfig", (), {})()
+        moe_config.has_bias = False
+
+        method = QuarkW4A16Int4MoEMethod(
+            quant_config.quant_config["global_quant_config"]["weight"],
+            quant_config.pack_method,
+            moe_config,
+        )
+
+        assert method.group_size == 128
+        assert method.pack_reorder
+
+    def test_quark_excluded_lm_head_keeps_native_weight_name(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config(exclude=["lm_head"]))
         mapper = quant_config.get_cache_scale_mapper()
 
@@ -618,12 +635,10 @@ class TestQuarkInt4Format:
             name for name, _ in mapper.apply([("lm_head.weight", torch.zeros(1))])
         }
 
-        assert quant_config.awq_config is not None
-        assert not quant_config.awq_config.lm_head_quantized
         assert "lm_head.weight" in output_names
         assert "lm_head.qweight" not in output_names
 
-    def test_quark_excluded_linear_is_not_remapped_to_qweight(self):
+    def test_quark_linear_weights_keep_native_names(self):
         quant_config = QuarkConfig.from_config(
             _quark_int4_config(
                 exclude=["model.language_model.layers.0.mlp.gate.linear"]
@@ -644,23 +659,17 @@ class TestQuarkInt4Format:
                         torch.zeros(1),
                     ),
                     ("layers.0.mlp.gate.weight", torch.zeros(1)),
-                    ("layers.0.mlp.gate.qweight", torch.zeros(1)),
                     ("layers.1.mlp.gate.weight", torch.zeros(1)),
                 ]
             )
         }
 
         assert "model.language_model.layers.0.mlp.gate.linear.weight" in output_names
-        assert (
-            "model.language_model.layers.0.mlp.gate.linear.qweight"
-            not in output_names
-        )
-        assert "model.language_model.layers.1.mlp.gate.linear.qweight" in output_names
+        assert "model.language_model.layers.1.mlp.gate.linear.weight" in output_names
         assert "layers.0.mlp.gate.weight" in output_names
-        assert "layers.0.mlp.gate.qweight" not in output_names
-        assert "layers.1.mlp.gate.qweight" in output_names
+        assert "layers.1.mlp.gate.weight" in output_names
 
-    def test_quark_excluded_projection_qweight_is_mapped_back_to_weight(self):
+    def test_quark_projection_weights_keep_native_names(self):
         quant_config = QuarkConfig.from_config(
             _quark_int4_config(exclude=["layers.0.mlp.shared_expert.down_proj"])
         )
@@ -683,32 +692,31 @@ class TestQuarkInt4Format:
         }
 
         assert "layers.0.mlp.shared_expert.down_proj.weight" in output_names
-        assert "layers.0.mlp.shared_expert.down_proj.qweight" not in output_names
-        assert "layers.1.mlp.shared_expert.down_proj.qweight" in output_names
+        assert "layers.1.mlp.shared_expert.down_proj.weight" in output_names
 
     def test_quark_mapper_adds_suffix_remappings(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config(symmetric=False))
         mapper = quant_config.get_cache_scale_mapper()
 
         assert ".qscales" in mapper.orig_to_new_suffix
-        assert mapper.orig_to_new_suffix[".qscales"] == ".scales"
+        assert mapper.orig_to_new_suffix[".qscales"] == ".weight_scale"
         assert ".qqzeros" in mapper.orig_to_new_suffix
-        assert mapper.orig_to_new_suffix[".qqzeros"] == ".qzeros"
+        assert mapper.orig_to_new_suffix[".qqzeros"] == ".weight_zero_point"
 
     def test_quark_mapper_renames_tensor_names(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config(symmetric=False))
         mapper = quant_config.get_cache_scale_mapper()
 
         input_weights = [
-            ("model.layers.0.mlp.down_proj.qweight", torch.zeros(1)),
+            ("model.layers.0.mlp.down_proj.weight", torch.zeros(1)),
             ("model.layers.0.mlp.down_proj.qscales", torch.zeros(1)),
             ("model.layers.0.mlp.down_proj.qqzeros", torch.zeros(1)),
         ]
         output_names = {name for name, _ in mapper.apply(input_weights)}
 
-        assert "model.layers.0.mlp.down_proj.qweight" in output_names
-        assert "model.layers.0.mlp.down_proj.scales" in output_names
-        assert "model.layers.0.mlp.down_proj.qzeros" in output_names
+        assert "model.layers.0.mlp.down_proj.weight" in output_names
+        assert "model.layers.0.mlp.down_proj.weight_scale" in output_names
+        assert "model.layers.0.mlp.down_proj.weight_zero_point" in output_names
         assert "model.layers.0.mlp.down_proj.qscales" not in output_names
         assert "model.layers.0.mlp.down_proj.qqzeros" not in output_names
 

@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.quark.schemes import (
     QuarkNVFP4,
     QuarkOCP_MX,
     QuarkScheme,
+    QuarkW4A16Int4,
     QuarkW4A8_MXFP4_FP8,
     QuarkW8A8Fp8,
     QuarkW8A8Int8,
@@ -37,6 +38,7 @@ from vllm.model_executor.layers.quantization.quark.utils import (
     deep_compare,
     should_ignore_layer,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.platforms import current_platform
 
@@ -51,16 +53,6 @@ logger = init_logger(__name__)
 # OCP MX fp4 Quark checkpoints
 _DEEPSEEK_V3_FAMILY_MODEL_TYPES = frozenset({"deepseek_v3", "deepseek_v32"})
 
-# Quark real_quantized INT4 exports use ".weight" for packed weights on
-# linear projections. Remap only known projection suffixes so unquantized
-# tensors such as embed_tokens.weight are left unchanged.
-_QUARK_INT4_LINEAR_WEIGHT_REGEX = re.compile(
-    r"\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|out_proj|"
-    r"in_proj_qkv|in_proj_z|in_proj_b|in_proj_a)\.weight$"
-)
-_QUARK_INT4_TOP_LEVEL_LM_HEAD_WEIGHT_REGEX = re.compile(r"^lm_head\.weight$")
-
-
 class QuarkConfig(QuantizationConfig):
     def __init__(
         self,
@@ -72,23 +64,18 @@ class QuarkConfig(QuantizationConfig):
         super().__init__()
         if kv_cache_group is None:
             kv_cache_group = []
+        quant_config["exclude"] = self._normalize_quark_excludes(
+            quant_config.get("exclude")
+        )
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
-        self.awq_config = None
-        if self._is_packed_int4_export(quant_config):
-            self.awq_config = self._create_int4_awq_adapter(quant_config)
         # Note : this flag is kept disabled because the overhead of
         # dynamic mxfp4 quantization negates the performance gains
         # that come from shifting to mxfp4. It is left here in case
         # we want to re-enable it in the future.
         self.dynamic_mxfp4_quant = False
-
-    def _sync_awq_config_model_attrs(self) -> None:
-        if self.awq_config is None:
-            return
-        self.awq_config.packed_modules_mapping = self.packed_modules_mapping
 
     @staticmethod
     def _is_packed_int4_export(config: dict[str, Any]) -> bool:
@@ -119,6 +106,8 @@ class QuarkConfig(QuantizationConfig):
                 module_name.removeprefix("model.language_model."),
                 module_name.replace("model.language_model.", "model.", 1),
             }
+            if module_name == "lm_head" or module_name.endswith(".lm_head"):
+                candidates.add("language_model.lm_head")
             for candidate in tuple(candidates):
                 if candidate.endswith(".gate.linear"):
                     candidates.add(candidate.removesuffix(".linear"))
@@ -128,34 +117,6 @@ class QuarkConfig(QuantizationConfig):
                 add(candidate)
 
         return normalized
-
-    @classmethod
-    def _create_int4_awq_adapter(cls, config: dict[str, Any]):
-        from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
-
-        weight_config = config.get("global_quant_config", {}).get("weight", {})
-        export_config = config.get("export", {})
-        modules_to_not_convert = cls._normalize_quark_excludes(config.get("exclude"))
-        lm_head_quantized = not any(
-            item == "lm_head"
-            or item.endswith(".lm_head")
-            or item.startswith("lm_head.")
-            for item in modules_to_not_convert or []
-        )
-        awq_config = AutoAWQConfig.from_config(
-            {
-                **config,
-                "bits": 4,
-                "group_size": weight_config.get("group_size", 128),
-                "zero_point": not weight_config.get("symmetric", True),
-                "modules_to_not_convert": modules_to_not_convert,
-                "lm_head": lm_head_quantized,
-                "pack_method": export_config.get("pack_method"),
-            }
-        )
-        awq_config.signed_int4 = True
-        awq_config.pack_reorder = export_config.get("pack_method") == "reorder"
-        return awq_config
 
     def maybe_update_config(
         self,
@@ -226,23 +187,14 @@ class QuarkConfig(QuantizationConfig):
         for k, v in self.quant_config.items():
             quant_config_with_hf_to_vllm_mapper[k] = apply_value(v)
 
+        quant_config_with_hf_to_vllm_mapper["exclude"] = self._normalize_quark_excludes(
+            quant_config_with_hf_to_vllm_mapper.get("exclude")
+        )
         self.quant_config = quant_config_with_hf_to_vllm_mapper
-        if self.awq_config is not None:
-            self._sync_awq_config_model_attrs()
-            self.awq_config.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
-        if self.awq_config is not None:
-            self._sync_awq_config_model_attrs()
-            awq_method = self.awq_config.get_quant_method(layer, prefix)
-            if awq_method is not None:
-                return awq_method
-            if isinstance(layer, Attention):
-                return QuarkKVCacheMethod(self)
-            return None
-
         # Check if the layer is skipped for quantization.
         exclude_layers = cast(list[str], self.quant_config.get("exclude"))
         if should_ignore_layer(
@@ -251,7 +203,7 @@ class QuarkConfig(QuantizationConfig):
             if (
                 "self_attn" not in prefix  # only quantize attention projections
                 or not getattr(self, "dynamic_mxfp4_quant", False)
-                or not isinstance(layer, LinearBase)  # Ignore other methods
+                or not isinstance(layer, (LinearBase, ParallelLMHead))
             ):
                 return UnquantizedLinearMethod()
 
@@ -262,7 +214,7 @@ class QuarkConfig(QuantizationConfig):
             )
             layer.scheme = scheme
             return QuarkLinearMethod(self)
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, (LinearBase, ParallelLMHead)):
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
             return QuarkLinearMethod(self)
@@ -472,6 +424,20 @@ class QuarkConfig(QuantizationConfig):
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
         return is_int8_dtype and is_tensor and is_weight_symmetric and is_static
+
+    def _is_w4a16_int4(
+        self,
+        weight_quant: dict[str, Any] | None,
+        input_quant: dict[str, Any] | None,
+    ) -> bool:
+        if weight_quant is None or input_quant is not None:
+            return False
+
+        is_int4 = weight_quant.get("dtype") == "int4"
+        is_grouped = weight_quant.get("qscheme", "per_group") == "per_group"
+        is_static = not weight_quant.get("is_dynamic")
+        is_packed = self.pack_method in ("order", "reorder")
+        return is_int4 and is_grouped and is_static and is_packed
 
     def _is_w4a8_mxfp4_fp8(
         self,
@@ -740,6 +706,11 @@ class QuarkConfig(QuantizationConfig):
                 is_static_input_scheme=True,
                 input_symmetric=input_config.get("symmetric"),
             )
+        elif self._is_w4a16_int4(weight_config, input_config):
+            return QuarkW4A16Int4(
+                group_size=weight_config.get("group_size", 128),
+                pack_method=self.pack_method,
+            )
         elif self._is_w4a8_mxfp4_fp8(weight_config, input_config):
             is_w4a8_supported = self._check_scheme_supported(
                 QuarkW4A8_MXFP4_FP8.get_min_capability(), error=False
@@ -780,78 +751,17 @@ class QuarkConfig(QuantizationConfig):
         return scheme
 
     def _get_int4_weight_mapper(self) -> "WeightsMapper":
-        if self.awq_config is None:
+        if not self._is_packed_int4_export(self.quant_config):
             return WeightsMapper()
 
-        excluded_modules = set(self.awq_config.modules_to_not_convert)
-        for module_name in tuple(excluded_modules):
-            if module_name.endswith(".gate"):
-                excluded_modules.add(f"{module_name}.linear")
-            elif module_name.endswith(".gate.linear"):
-                excluded_modules.add(module_name.removesuffix(".linear"))
-
-        excluded_linear_modules = [
-            re.escape(module_name)
-            for module_name in excluded_modules
-            if module_name.endswith(".linear")
-        ]
-        excluded_gate_modules = [
-            re.escape(module_name)
-            for module_name in excluded_modules
-            if module_name.endswith(".gate")
-        ]
-        excluded_module_pattern = "|".join(
-            re.escape(module_name) for module_name in excluded_modules
-        )
-
         suffix_map: dict[str, str | None] = {
-            ".qscales": ".scales",
-            ".weight_scale": ".scales",
+            ".qscales": ".weight_scale",
+            ".qqzeros": ".weight_zero_point",
         }
-        if self.awq_config.zero_point:
-            suffix_map[".qqzeros"] = ".qzeros"
-            suffix_map[".weight_zero_point"] = ".qzeros"
-        else:
-            # Quark symmetric INT4 may still export all-zero zero points.
-            suffix_map[".qqzeros"] = None
-            suffix_map[".weight_zero_point"] = None
-
         regex_map: dict[re.Pattern[str], str | None] = {
-            _QUARK_INT4_LINEAR_WEIGHT_REGEX: r".\1.qweight",
             re.compile(r"\.shared_expert_gate\.weight_scale$"): None,
             re.compile(r"\.shared_expert_gate\.weight_zero_point$"): None,
         }
-        linear_exclude = "|".join(excluded_linear_modules)
-        linear_weight_pattern = (
-            rf"^(?!(?:{linear_exclude})\.weight$)(?P<prefix>.*)\.linear\.weight$"
-            if linear_exclude
-            else r"^(?P<prefix>.*)\.linear\.weight$"
-        )
-        regex_map[re.compile(linear_weight_pattern)] = r"\g<prefix>.linear.qweight"
-        if linear_exclude:
-            regex_map[
-                re.compile(rf"^(?P<prefix>{linear_exclude})\.qweight$")
-            ] = r"\g<prefix>.weight"
-
-        gate_exclude = "|".join(excluded_gate_modules)
-        gate_weight_pattern = (
-            rf"^(?!(?:{gate_exclude})\.weight$)(?P<prefix>.*)\.gate\.weight$"
-            if gate_exclude
-            else r"^(?P<prefix>.*)\.gate\.weight$"
-        )
-        regex_map[re.compile(gate_weight_pattern)] = r"\g<prefix>.gate.qweight"
-        if gate_exclude:
-            regex_map[
-                re.compile(rf"^(?P<prefix>{gate_exclude})\.qweight$")
-            ] = r"\g<prefix>.weight"
-
-        if excluded_module_pattern:
-            regex_map[
-                re.compile(rf"^(?P<prefix>{excluded_module_pattern})\.qweight$")
-            ] = r"\g<prefix>.weight"
-
-        if self.awq_config.lm_head_quantized:
-            regex_map[_QUARK_INT4_TOP_LEVEL_LM_HEAD_WEIGHT_REGEX] = "lm_head.qweight"
 
         return WeightsMapper(
             orig_to_new_suffix=suffix_map,
@@ -867,7 +777,7 @@ class QuarkConfig(QuantizationConfig):
             ".self_attn.prob_output_scale": ".self_attn.attn.prob_scale",
         }
         cache_scale_mapper = WeightsMapper(orig_to_new_suffix=orig_to_new_suffix)
-        if self.awq_config is not None:
+        if self._is_packed_int4_export(self.quant_config):
             cache_scale_mapper |= self._get_int4_weight_mapper()
         return cache_scale_mapper | QuantizationConfig.get_cache_scale_mapper()
 

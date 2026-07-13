@@ -516,13 +516,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         skip_prefixes = ["mtp."]
         if self.language_model.config.tie_word_embeddings:
             skip_prefixes = ["language_model.lm_head.", *skip_prefixes]
+        mapper = self.hf_to_vllm_mapper | WeightsMapper(
+            orig_to_new_prefix={"lm_head.": "language_model.lm_head."}
+        )
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=skip_prefixes,
         )
         return loader.load_weights(
             _dequantize_quark_shared_expert_gate_weights(weights),
-            mapper=self.hf_to_vllm_mapper,
+            mapper=mapper,
         )
 
     @classmethod

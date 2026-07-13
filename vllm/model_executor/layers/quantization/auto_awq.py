@@ -93,8 +93,6 @@ def _convert_awq_to_standard_format(
     w_q_name: str,
     w_zp_name: str,
     size_bits: int,
-    *,
-    apply_awq_pack_reorder: bool = True,
 ) -> None:
     """Convert AWQ weight and zero-point tensors to standard GPTQ-like format.
 
@@ -106,12 +104,7 @@ def _convert_awq_to_standard_format(
     mask = (1 << size_bits) - 1
     device = getattr(layer, w_q_name).device
     shifts = torch.arange(0, 32, size_bits, dtype=torch.int32, device=device)
-    if apply_awq_pack_reorder:
-        pack_order = torch.tensor(
-            _REVERSE_AWQ_PACK_ORDER, dtype=torch.long, device=device
-        )
-    else:
-        pack_order = torch.arange(pack_factor, dtype=torch.long, device=device)
+    pack_order = torch.tensor(_REVERSE_AWQ_PACK_ORDER, dtype=torch.long, device=device)
 
     # --- Convert qweight: (K, N // pack) packed_dim=1 → (K // pack, N) packed_dim=0
     qw = getattr(layer, w_q_name).data
@@ -538,7 +531,6 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
             "qweight",
             "qzeros",
             self.quant_config.quant_type.size_bits,
-            apply_awq_pack_reorder=getattr(self.quant_config, "pack_reorder", True),
         )
         self.kernel.process_weights_after_loading(layer)
 
@@ -934,8 +926,6 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         scales = layer.scales
         qzeros = layer.qzeros
         pack_factor = self.quant_config.pack_factor
-        signed_int4 = getattr(self.quant_config, "signed_int4", False)
-        pack_reorder = getattr(self.quant_config, "pack_reorder", True)
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
@@ -947,8 +937,6 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
                 0,
                 0,
                 0,
-                signed_int4=signed_int4,
-                pack_reorder=pack_reorder,
             )
             out = torch.matmul(reshaped_x, out)
         else:
@@ -958,8 +946,6 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
                 scales,
                 qzeros,
                 pack_factor,
-                signed_int4=signed_int4,
-                pack_reorder=pack_reorder,
             )
         if bias is not None:
             out.add_(bias)
