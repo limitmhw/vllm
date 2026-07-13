@@ -42,6 +42,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.quark.utils import (
+    dequantize_quark_shared_expert_gate_weights,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -76,70 +79,6 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
-
-
-def _dequantize_quark_shared_expert_gate(
-    qweight: torch.Tensor, scales: torch.Tensor
-) -> torch.Tensor:
-    values = qweight.to(torch.int32) & 0xF
-    values = torch.where(values >= 8, values - 16, values)
-    scales = scales.to(torch.float32).repeat_interleave(128, dim=0)
-    return (values.to(torch.float32) * scales).T.contiguous()
-
-
-def _dequantize_quark_shared_expert_gate_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    pending_weights: dict[str, torch.Tensor] = {}
-    pending_scales: dict[str, torch.Tensor] = {}
-    dequantized_prefixes: set[str] = set()
-
-    def maybe_emit(prefix: str):
-        qweight = pending_weights.pop(prefix, None)
-        scales = pending_scales.pop(prefix, None)
-        if qweight is None or scales is None:
-            if qweight is not None:
-                pending_weights[prefix] = qweight
-            if scales is not None:
-                pending_scales[prefix] = scales
-            return None
-        dequantized_prefixes.add(prefix)
-        return prefix + ".weight", _dequantize_quark_shared_expert_gate(qweight, scales)
-
-    for name, weight in weights:
-        if name.endswith(".shared_expert_gate.weight_scale") or name.endswith(
-            ".shared_expert_gate.scales"
-        ):
-            prefix = name.rsplit(".", 1)[0]
-            pending_scales[prefix] = weight
-            emitted = maybe_emit(prefix)
-            if emitted is not None:
-                yield emitted
-            continue
-        if (
-            name.endswith(".shared_expert_gate.weight")
-            or name.endswith(".shared_expert_gate.qweight")
-        ) and weight.dtype in (torch.int32, torch.int64):
-            prefix = name.rsplit(".", 1)[0]
-            pending_weights[prefix] = weight
-            emitted = maybe_emit(prefix)
-            if emitted is not None:
-                yield emitted
-            continue
-        if ".shared_expert_gate." in name and (
-            name.endswith(".weight_zero_point")
-            or name.endswith(".qzeros")
-            or name.endswith(".qqzeros")
-        ):
-            continue
-        yield name, weight
-
-    for prefix, weight in pending_weights.items():
-        if prefix not in dequantized_prefixes:
-            yield prefix + ".weight", weight
-    for prefix, scales in pending_scales.items():
-        if prefix not in dequantized_prefixes:
-            yield prefix + ".weight_scale", scales
 
 
 def _is_shared_expert_fse_compatible(quant_config) -> bool:
@@ -702,7 +641,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
             )
         loader = AutoWeightsLoader(self)
-        weights = _dequantize_quark_shared_expert_gate_weights(weights)
+        weights = dequantize_quark_shared_expert_gate_weights(weights)
         return loader.load_weights(weights, mapper=mapper)
 
 

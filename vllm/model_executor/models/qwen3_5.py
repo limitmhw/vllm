@@ -47,6 +47,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.quantization.quark.utils import (
+    dequantize_quark_shared_expert_gate_weights,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -76,7 +79,6 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
-    _dequantize_quark_shared_expert_gate_weights,
     _is_shared_expert_fse_compatible,
 )
 from .qwen3_vl import (
@@ -370,7 +372,7 @@ class Qwen3_5ForCausalLMBase(
             skip_prefixes=skip_prefixes,
         )
         return loader.load_weights(
-            _dequantize_quark_shared_expert_gate_weights(weights)
+            dequantize_quark_shared_expert_gate_weights(weights)
         )
 
 
@@ -524,7 +526,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             skip_prefixes=skip_prefixes,
         )
         return loader.load_weights(
-            _dequantize_quark_shared_expert_gate_weights(weights),
+            dequantize_quark_shared_expert_gate_weights(weights),
             mapper=mapper,
         )
 
