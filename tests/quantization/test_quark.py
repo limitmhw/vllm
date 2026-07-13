@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.quark.schemes import QuarkW4A16Int4
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.platforms import current_platform
 
 if current_platform.is_rocm():
@@ -741,6 +742,25 @@ class TestQuarkInt4Format:
         assert mapper.orig_to_new_suffix[".qscales"] == ".weight_scale"
         assert ".qqzeros" in mapper.orig_to_new_suffix
         assert mapper.orig_to_new_suffix[".qqzeros"] == ".weight_zero_point"
+
+    def test_quark_apply_mapper_updates_layer_quant_config_keys(self):
+        quant_config = QuarkConfig.from_config(
+            {
+                **_quark_int4_config(),
+                "layer_quant_config": {
+                    "model.language_model.layers.0.mlp.gate.linear": {
+                        "weight": {"dtype": "float16"},
+                    },
+                },
+            }
+        )
+        quant_config.apply_vllm_mapper(
+            WeightsMapper(orig_to_new_substr={".gate.linear": ".gate"})
+        )
+
+        layer_quant_config = quant_config.quant_config["layer_quant_config"]
+        assert "model.language_model.layers.0.mlp.gate" in layer_quant_config
+        assert "model.language_model.layers.0.mlp.gate.linear" not in layer_quant_config
 
     def test_quark_mapper_renames_tensor_names(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config(symmetric=False))

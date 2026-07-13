@@ -4,7 +4,6 @@
 import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
-import regex as re
 import torch
 from transformers import PretrainedConfig
 
@@ -169,15 +168,18 @@ class QuarkConfig(QuantizationConfig):
             hf_to_vllm_mapper: maps from hf model structure (the assumed
                 structure of the qconfig) to vllm model structure
         """
+        def apply_string(value: str) -> str:
+            mapped_value = hf_to_vllm_mapper.apply_list([value])
+            return mapped_value[0] if mapped_value else value
+
         def apply_value(value: Any) -> Any:
             if isinstance(value, str):
-                mapped_value = hf_to_vllm_mapper.apply_list([value])
-                return mapped_value[0] if mapped_value else value
+                return apply_string(value)
             if isinstance(value, list):
                 return [apply_value(item) for item in value]
             if isinstance(value, dict):
                 return {
-                    key: apply_value(item)
+                    apply_string(key) if isinstance(key, str) else key: apply_value(item)
                     for key, item in value.items()
                 }
             return value

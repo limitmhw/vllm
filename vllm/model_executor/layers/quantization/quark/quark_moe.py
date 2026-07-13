@@ -325,8 +325,10 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
 
             if (
                 layer.group_size_div_factor > 1
-                and "weight_zero_point" in weight_name
-                or "weight_scale" in weight_name
+                and (
+                    "weight_zero_point" in weight_name
+                    or "weight_scale" in weight_name
+                )
             ):
                 loaded_weight = loaded_weight.repeat_interleave(
                     layer.group_size_div_factor, 1
