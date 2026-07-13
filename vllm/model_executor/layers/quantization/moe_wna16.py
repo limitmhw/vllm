@@ -43,8 +43,7 @@ class MoeWNA16Config(QuantizationConfig):
         lm_head_quantized: bool,
         modules_to_not_convert: list[str] | None,
         full_config: dict[str, Any],
-        is_quark_format: bool = False,
-        quark_pack_reorder: bool = True,
+        pack_reorder: bool = True,
         signed_int4: bool = False,
     ) -> None:
         super().__init__()
@@ -55,8 +54,7 @@ class MoeWNA16Config(QuantizationConfig):
         self.lm_head_quantized = lm_head_quantized
         self.linear_quant_method = linear_quant_method
         self.full_config = full_config
-        self.is_quark_format = is_quark_format
-        self.quark_pack_reorder = quark_pack_reorder
+        self.pack_reorder = pack_reorder
         self.signed_int4 = signed_int4
         # Avoid circular import
         from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -118,9 +116,10 @@ class MoeWNA16Config(QuantizationConfig):
             raise ValueError("moe_wna16 only support gptq and awq.")
 
         pack_method = config.get("pack_method")
-        is_quark_format = pack_method in ("order", "reorder")
-        quark_pack_reorder = (not is_quark_format) or pack_method == "reorder"
-        signed_int4 = is_quark_format and weight_bits == 4 and not has_zp
+        pack_reorder = pack_method != "order"
+        signed_int4 = (
+            pack_method in ("order", "reorder") and weight_bits == 4 and not has_zp
+        )
 
         return cls(
             linear_quant_method,
@@ -130,8 +129,7 @@ class MoeWNA16Config(QuantizationConfig):
             lm_head_quantized,
             modules_to_not_convert,
             config,
-            is_quark_format,
-            quark_pack_reorder,
+            pack_reorder,
             signed_int4,
         )
 
@@ -403,7 +401,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             # 3. change order, see
             # https://github.com/casper-hansen/AutoAWQ/blob/v0.2.8/awq/utils/quant_utils.py
             # shape -> (a, 4 * b * pack_factor_bit8)
-            if layer.quant_config.quark_pack_reorder:
+            if layer.quant_config.pack_reorder:
                 reverse_awq_pack_order = [0, 4, 1, 5, 2, 6, 3, 7]
                 tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
             else:

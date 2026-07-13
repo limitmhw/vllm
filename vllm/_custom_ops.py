@@ -479,6 +479,10 @@ def awq_dequantize(
             signed_int4=signed_int4,
             pack_reorder=pack_reorder,
         )
+    if signed_int4 or not pack_reorder:
+        raise NotImplementedError(
+            "signed INT4 or non-AWQ pack order requires Triton AWQ kernels"
+        )
     return torch.ops._C.awq_dequantize(qweight, scales, zeros, split_k_iters, thx, thy)
 
 
@@ -519,6 +523,10 @@ def awq_gemm(
             split_k_iters,
             signed_int4=signed_int4,
             pack_reorder=pack_reorder,
+        )
+    if signed_int4 or not pack_reorder:
+        raise NotImplementedError(
+            "signed INT4 or non-AWQ pack order requires Triton AWQ kernels"
         )
     return torch.ops._C.awq_gemm(input, qweight, scales, qzeros, split_k_iters)
 

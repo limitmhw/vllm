@@ -92,6 +92,7 @@ def _dequantize_quark_shared_expert_gate_weights(
 ) -> Iterable[tuple[str, torch.Tensor]]:
     pending_weights: dict[str, torch.Tensor] = {}
     pending_scales: dict[str, torch.Tensor] = {}
+    dequantized_prefixes: set[str] = set()
 
     def maybe_emit(prefix: str):
         qweight = pending_weights.pop(prefix, None)
@@ -102,32 +103,43 @@ def _dequantize_quark_shared_expert_gate_weights(
             if scales is not None:
                 pending_scales[prefix] = scales
             return None
-        return prefix + ".weight", _dequantize_quark_shared_expert_gate(
-            qweight, scales
-        )
+        dequantized_prefixes.add(prefix)
+        return prefix + ".weight", _dequantize_quark_shared_expert_gate(qweight, scales)
 
     for name, weight in weights:
-        if name.endswith(".shared_expert_gate.weight_scale"):
-            prefix = name[: -len(".weight_scale")]
+        if name.endswith(".shared_expert_gate.weight_scale") or name.endswith(
+            ".shared_expert_gate.scales"
+        ):
+            prefix = name.rsplit(".", 1)[0]
             pending_scales[prefix] = weight
             emitted = maybe_emit(prefix)
             if emitted is not None:
                 yield emitted
             continue
-        if name.endswith(".shared_expert_gate.weight") and weight.dtype in (
-            torch.int32,
-            torch.int64,
-        ):
-            prefix = name[: -len(".weight")]
+        if (
+            name.endswith(".shared_expert_gate.weight")
+            or name.endswith(".shared_expert_gate.qweight")
+        ) and weight.dtype in (torch.int32, torch.int64):
+            prefix = name.rsplit(".", 1)[0]
             pending_weights[prefix] = weight
             emitted = maybe_emit(prefix)
             if emitted is not None:
                 yield emitted
             continue
+        if ".shared_expert_gate." in name and (
+            name.endswith(".weight_zero_point")
+            or name.endswith(".qzeros")
+            or name.endswith(".qqzeros")
+        ):
+            continue
         yield name, weight
 
     for prefix, weight in pending_weights.items():
-        yield prefix + ".weight", weight
+        if prefix not in dequantized_prefixes:
+            yield prefix + ".weight", weight
+    for prefix, scales in pending_scales.items():
+        if prefix not in dequantized_prefixes:
+            yield prefix + ".weight_scale", scales
 
 
 def _is_shared_expert_fse_compatible(quant_config) -> bool:

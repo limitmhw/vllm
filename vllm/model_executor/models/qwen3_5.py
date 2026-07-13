@@ -76,6 +76,7 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _dequantize_quark_shared_expert_gate_weights,
     _is_shared_expert_fse_compatible,
 )
 from .qwen3_vl import (
@@ -255,76 +256,6 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
-    @staticmethod
-    def _dequantize_shared_expert_gate_weights(
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Dequantize Quark AWQ shared-expert gate weights to fp16."""
-        weight_map: dict[str, torch.Tensor] = {}
-        scale_map: dict[str, torch.Tensor] = {}
-        passthrough: list[tuple[str, torch.Tensor]] = []
-
-        for name, weight in weights:
-            if name.endswith(".shared_expert_gate.weight_scale") or name.endswith(
-                ".shared_expert_gate.scales"
-            ):
-                prefix = name.rsplit(".", 1)[0]
-                scale_map[prefix] = weight
-            elif name.endswith(".shared_expert_gate.weight") or name.endswith(
-                ".shared_expert_gate.qweight"
-            ):
-                prefix = name.rsplit(".", 1)[0]
-                weight_map[prefix] = weight
-            else:
-                passthrough.append((name, weight))
-
-        group_size = 128
-        dequantized_prefixes: set[str] = set()
-        dequantized: list[tuple[str, torch.Tensor]] = []
-        for prefix, weight in weight_map.items():
-            scale = scale_map.get(prefix)
-            if scale is None:
-                passthrough.append((f"{prefix}.weight", weight))
-                continue
-            values = weight.to(torch.int32) & 0xF
-            values = torch.where(values >= 8, values - 16, values)
-            scale_expanded = scale.to(torch.float32).repeat_interleave(
-                group_size, dim=0
-            )
-            dequantized.append(
-                (
-                    f"{prefix}.weight",
-                    (values.to(torch.float32) * scale_expanded)
-                    .t()
-                    .contiguous(),
-                )
-            )
-            dequantized_prefixes.add(prefix)
-
-        for prefix, scale in scale_map.items():
-            if prefix not in dequantized_prefixes:
-                passthrough.append((f"{prefix}.weight_scale", scale))
-
-        for name, weight in passthrough:
-            if ".shared_expert_gate." in name and (
-                name.endswith(".weight_zero_point")
-                or name.endswith(".scales")
-                or name.endswith(".qzeros")
-                or name.endswith(".qweight")
-            ):
-                continue
-            if name.endswith(".shared_expert_gate.weight_scale"):
-                prefix = name.removesuffix(".weight_scale")
-                if prefix in dequantized_prefixes:
-                    continue
-            if name.endswith(".shared_expert_gate.weight"):
-                prefix = name.rsplit(".", 1)[0]
-                if prefix in dequantized_prefixes:
-                    continue
-            yield name, weight
-
-        yield from dequantized
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = self.hf_to_vllm_mapper
         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
@@ -439,7 +370,7 @@ class Qwen3_5ForCausalLMBase(
             skip_prefixes=skip_prefixes,
         )
         return loader.load_weights(
-            Qwen3_5Model._dequantize_shared_expert_gate_weights(weights)
+            _dequantize_quark_shared_expert_gate_weights(weights)
         )
 
 
@@ -590,7 +521,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             skip_prefixes=skip_prefixes,
         )
         return loader.load_weights(
-            Qwen3_5Model._dequantize_shared_expert_gate_weights(weights),
+            _dequantize_quark_shared_expert_gate_weights(weights),
             mapper=self.hf_to_vllm_mapper,
         )
 
