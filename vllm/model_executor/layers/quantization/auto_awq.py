@@ -75,6 +75,7 @@ logger = init_logger(__name__)
 # [0,4,1,5,2,6,3,7]. This permutation reverses that ordering.
 _REVERSE_AWQ_PACK_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
 
+
 def _replace_or_register_parameter(
     layer: torch.nn.Module,
     name: str,
@@ -103,8 +104,10 @@ def _convert_awq_to_standard_format(
     pack_factor = 32 // size_bits
     mask = (1 << size_bits) - 1
     device = getattr(layer, w_q_name).device
+    reverse_order = torch.tensor(
+        _REVERSE_AWQ_PACK_ORDER, dtype=torch.long, device=device
+    )
     shifts = torch.arange(0, 32, size_bits, dtype=torch.int32, device=device)
-    pack_order = torch.tensor(_REVERSE_AWQ_PACK_ORDER, dtype=torch.long, device=device)
 
     # --- Convert qweight: (K, N // pack) packed_dim=1 → (K // pack, N) packed_dim=0
     qw = getattr(layer, w_q_name).data
@@ -113,7 +116,7 @@ def _convert_awq_to_standard_format(
 
     # Unpack int32 → individual values, fix AWQ ordering
     unpacked = (qw.unsqueeze(-1) >> shifts) & mask  # (K, N_packed, pack_factor)
-    unpacked = unpacked[:, :, pack_order]
+    unpacked = unpacked[:, :, reverse_order]
     unpacked = unpacked.reshape(K, N)  # (K, N)
 
     # Repack along input dim (dim 0)
@@ -143,7 +146,7 @@ def _convert_awq_to_standard_format(
     G, _ = qz.shape
 
     unpacked_zp = (qz.unsqueeze(-1) >> shifts) & mask  # (G, N_packed, pack_factor)
-    unpacked_zp = unpacked_zp[:, :, pack_order]
+    unpacked_zp = unpacked_zp[:, :, reverse_order]
     unpacked_zp = unpacked_zp.reshape(G, N)  # (G, N) individual values
 
     # Transpose and repack along dim 0 (output dim)
@@ -527,10 +530,7 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
         # (GPTQ-like: standard bit order, qweight packed along input dim)
         # before handing off to the kernel.
         _convert_awq_to_standard_format(
-            layer,
-            "qweight",
-            "qzeros",
-            self.quant_config.quant_type.size_bits,
+            layer, "qweight", "qzeros", self.quant_config.quant_type.size_bits
         )
         self.kernel.process_weights_after_loading(layer)
 
@@ -913,8 +913,6 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        if not self.quant_config.zero_point:
-            layer.qzeros.data.zero_()
 
     def apply(
         self,
@@ -929,24 +927,15 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        if x.shape[:-1].numel() >= 256 or envs.VLLM_BATCH_INVARIANT:
-            out = ops.awq_dequantize(
-                qweight,
-                scales,
-                qzeros,
-                0,
-                0,
-                0,
-            )
+        # num_tokens >= threshold
+        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+        # Batch invariant mode requires torch.matmul path
+        # for Triton override
+        if FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
+            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
             out = torch.matmul(reshaped_x, out)
         else:
-            out = ops.awq_gemm(
-                reshaped_x,
-                qweight,
-                scales,
-                qzeros,
-                pack_factor,
-            )
+            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)
