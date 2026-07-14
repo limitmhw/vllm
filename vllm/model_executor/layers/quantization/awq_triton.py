@@ -7,15 +7,6 @@ from vllm.triton_utils import tl, triton
 
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
-# AWQ uses a non-standard packing order within int32 values.
-_REVERSE_AWQ_PACK_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
-
-
-@triton.jit
-def _sign_extend_int4_triton(values):
-    values = values.to(tl.int32)
-    return tl.where(values >= 8, values - 16, values)
-
 
 @triton.jit
 def awq_dequantize_kernel(
@@ -28,8 +19,6 @@ def awq_dequantize_kernel(
     num_rows,  # input num rows in qweight
     BLOCK_SIZE_X: tl.constexpr,
     BLOCK_SIZE_Y: tl.constexpr,
-    SIGNED_INT4: tl.constexpr,
-    PACK_REORDER: tl.constexpr,
 ):
     # Set up the pids.
     pid_x = tl.program_id(axis=0)
@@ -62,23 +51,20 @@ def awq_dequantize_kernel(
     iweights = tl.interleave(iweights, iweights)
     iweights = tl.interleave(iweights, iweights)
 
-    # Create nibble unpack shifts. AWQ reorder uses [0,4,1,5,2,6,3,7];
-    # Quark file-to-file "order" packing uses sequential [0..7].
-    if PACK_REORDER:
-        pack_order_tensor = (
-            (tl.arange(0, 2) * 4)[None, :] + tl.arange(0, 4)[:, None]
-        ).reshape(8)
-    else:
-        pack_order_tensor = tl.arange(0, 8)
+    # Create reverse AWQ order as tensor: [0, 4, 1, 5, 2, 6, 3, 7]
+    # that will map given indices to the correct order.
+    reverse_awq_order_tensor = (
+        (tl.arange(0, 2) * 4)[None, :] + tl.arange(0, 4)[:, None]
+    ).reshape(8)
 
-    shifts = pack_order_tensor * 4
+    # Use this to compute a set of shifts that can be used to unpack and
+    # reorder the values in iweights and zeros.
+    shifts = reverse_awq_order_tensor * 4
     shifts = tl.broadcast_to(shifts[None, :], (BLOCK_SIZE_Y * BLOCK_SIZE_X, 8))
     shifts = tl.reshape(shifts, (BLOCK_SIZE_Y, BLOCK_SIZE_X * 8))
 
     # Unpack and reorder: shift out the correct 4-bit value and mask.
     iweights = (iweights >> shifts) & 0xF
-    if SIGNED_INT4:
-        iweights = _sign_extend_int4_triton(iweights)
 
     # Compute zero offsets and masks.
     zero_offsets_y = pid_y * BLOCK_SIZE_Y // group_size + tl.arange(0, 1)
@@ -98,8 +84,6 @@ def awq_dequantize_kernel(
 
     # Unpack and reorder: shift out the correct 4-bit value and mask.
     zeros = (zeros >> shifts) & 0xF
-    if SIGNED_INT4:
-        zeros = _sign_extend_int4_triton(zeros)
 
     # Compute scale offsets and masks.
     scale_offsets_y = pid_y * BLOCK_SIZE_Y // group_size + tl.arange(0, 1)
@@ -136,8 +120,6 @@ def awq_gemm_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    SIGNED_INT4: tl.constexpr,
-    PACK_REORDER: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     pid_z = tl.program_id(1)
@@ -149,16 +131,24 @@ def awq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator_dtype = c_ptr.type.element_ty
 
-    if PACK_REORDER:
-        pack_order_tensor = (
-            (tl.arange(0, 2) * 4)[None, :] + tl.arange(0, 4)[:, None]
-        ).reshape(8)
-    else:
-        pack_order_tensor = tl.arange(0, 8)
+    # NOTE: This doesn't work in TRITON_INTERPRET=1 mode.  Use below instead.
+    # accumulator = tl.arange(0, BLOCK_SIZE_N)
+    # accumulator = tl.broadcast_to(accumulator[None, :],
+    # (BLOCK_SIZE_M, BLOCK_SIZE_N))
+    # accumulator = accumulator & 0x0
+    # accumulator = accumulator.to(accumulator_dtype)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
 
-    shifts = pack_order_tensor * 4
+    # Create reverse AWQ order as tensor: [0, 4, 1, 5, 2, 6, 3, 7]
+    # that will map given indices to the correct order.
+    reverse_awq_order_tensor = (
+        (tl.arange(0, 2) * 4)[None, :] + tl.arange(0, 4)[:, None]
+    ).reshape(8)
+
+    # Create the necessary shifts to use to unpack.
+    shifts = reverse_awq_order_tensor * 4
     shifts = tl.broadcast_to(shifts[None, :], (BLOCK_SIZE_K * (BLOCK_SIZE_N // 8), 8))
     shifts = tl.reshape(shifts, (BLOCK_SIZE_K, BLOCK_SIZE_N))
 
@@ -189,7 +179,6 @@ def awq_gemm_kernel(
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
         a = tl.load(a_ptrs, mask=masks_a, other=0.0)
-        a = a.to(tl.float32)
 
         masks_b = masks_k[:, None] & masks_bn[None, :]
         b = tl.load(b_ptrs, mask=masks_b, other=0.0)
@@ -220,14 +209,11 @@ def awq_gemm_kernel(
 
         b = (b >> shifts) & 0xF
         zeros = (zeros >> shifts) & 0xF
-        if SIGNED_INT4:
-            b = _sign_extend_int4_triton(b)
-            zeros = _sign_extend_int4_triton(zeros)
         b = (b - zeros) * scales
-        b = b.to(tl.float32)
+        b = b.to(c_ptr.type.element_ty)
 
         # Accumulate results.
-        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32)
+        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
 
         offsets_k += BLOCK_SIZE_K * SPLIT_K
         a_ptrs += BLOCK_SIZE_K * SPLIT_K
@@ -250,8 +236,6 @@ def awq_dequantize_triton(
     zeros: torch.Tensor,
     block_size_x: int = 32,
     block_size_y: int = 32,
-    signed_int4: bool = False,
-    pack_reorder: bool = True,
 ) -> torch.Tensor:
     K = qweight.shape[0]
     M = scales.shape[1]
@@ -290,8 +274,6 @@ def awq_dequantize_triton(
         Y,
         BLOCK_SIZE_X=block_size_x,
         BLOCK_SIZE_Y=block_size_y,
-        SIGNED_INT4=signed_int4,
-        PACK_REORDER=pack_reorder,
     )
 
     return result
@@ -311,8 +293,6 @@ def awq_gemm_triton(
     block_size_m: int = 32,
     block_size_n: int = 32,
     block_size_k: int = 32,
-    signed_int4: bool = False,
-    pack_reorder: bool = True,
 ) -> torch.Tensor:
     M, K = input.shape
     N = qweight.shape[1] * 8
@@ -350,8 +330,6 @@ def awq_gemm_triton(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         SPLIT_K=split_k_iters,
-        SIGNED_INT4=signed_int4,
-        PACK_REORDER=pack_reorder,
     )
 
     result = result.sum(0)

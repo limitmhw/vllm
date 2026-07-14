@@ -579,9 +579,9 @@ def _dequantize_quark_signed_awq_torch(
 ) -> torch.Tensor:
     bits = 4
     shifts = torch.arange(0, 32, bits, device=qweight.device)
-    iweights = (qweight[:, :, None] >> shifts[None, None, :]).to(torch.int8)
+    iweights = ((qweight[:, :, None] >> shifts[None, None, :]) & 0xF).to(torch.int8)
     iweights = iweights.view(qweight.shape[0], -1)
-    zeros = (qzeros[:, :, None] >> shifts[None, None, :]).to(torch.int8)
+    zeros = ((qzeros[:, :, None] >> shifts[None, None, :]) & 0xF).to(torch.int8)
     zeros = zeros.view(qzeros.shape[0], -1)
 
     if pack_reorder:
@@ -600,6 +600,42 @@ def _dequantize_quark_signed_awq_torch(
     scales = scales.repeat_interleave(group_size, dim=0)
     zeros = zeros.repeat_interleave(group_size, dim=0)
     return (iweights - zeros) * scales
+
+
+def _dequantize_awq_unsigned_torch(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    bits = 4
+    shifts = torch.arange(0, 32, bits, device=qweight.device)
+    iweights = ((qweight[:, :, None] >> shifts[None, None, :]) & 0xF).to(torch.int8)
+    iweights = iweights.view(qweight.shape[0], -1)
+    zeros = ((qzeros[:, :, None] >> shifts[None, None, :]) & 0xF).to(torch.int8)
+    zeros = zeros.view(qzeros.shape[0], -1)
+
+    order = torch.tensor(_REVERSE_AWQ_PACK_ORDER, device=qweight.device)
+    iweights = iweights.view(qweight.shape[0], -1, 8)[:, :, order].reshape(
+        qweight.shape[0], -1
+    )
+    zeros = zeros.view(qzeros.shape[0], -1, 8)[:, :, order].reshape(
+        qzeros.shape[0], -1
+    )
+
+    scales = scales.repeat_interleave(group_size, dim=0)
+    zeros = zeros.repeat_interleave(group_size, dim=0)
+    return (iweights - zeros) * scales
+
+
+def _pack_int4_nibbles(nibbles: torch.Tensor, *, pack_reorder: bool) -> torch.Tensor:
+    pack_order = (
+        torch.tensor(_REVERSE_AWQ_PACK_ORDER, device=nibbles.device)
+        if pack_reorder
+        else torch.arange(8, device=nibbles.device)
+    )
+    shifts = pack_order * 4
+    return ((nibbles.to(torch.int64) & 0xF) << shifts).sum(dim=-1).to(torch.int32)
 
 
 class TestQuarkInt4Format:
@@ -805,39 +841,31 @@ class TestQuarkInt4Format:
         assert "model.layers.0.mlp.down_proj.qqzeros" not in output_names
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="Quark signed INT4 Triton test requires CUDA/ROCm.",
-)
-def test_quark_signed_int4_triton_matches_torch():
-    """Signed INT4 path must match Quark's packed symmetric INT4 tensors."""
-    import os
+@pytest.mark.parametrize("pack_method", ["order", "reorder"])
+def test_quark_int4_canonicalizes_to_awq_unsigned_pack(pack_method):
+    """Quark signed INT4 tensors are adapted before shared AWQ kernels see them."""
+    pack_reorder = pack_method == "reorder"
+    group_size = 2
+    signed_weight = torch.tensor(
+        [
+            [0, 1, 7, 8, 9, 15, 2, 14],
+            [15, 8, 0, 3, 12, 7, 1, 9],
+        ],
+        dtype=torch.int32,
+    )
+    signed_zero = torch.zeros((1, 8), dtype=torch.int32)
+    qweight = _pack_int4_nibbles(signed_weight, pack_reorder=pack_reorder).view(2, 1)
+    qzeros = _pack_int4_nibbles(signed_zero, pack_reorder=pack_reorder).view(1, 1)
+    scales = torch.ones((1, 8), dtype=torch.float16)
 
-    from safetensors.torch import load_file
-
-    from vllm.model_executor.layers.quantization.awq_triton import (
-        awq_dequantize_triton,
+    expected = _dequantize_quark_signed_awq_torch(
+        qweight, scales, qzeros, group_size, pack_reorder=pack_reorder
+    )
+    scheme = QuarkW4A16Int4(group_size=group_size, pack_method=pack_method)
+    canonical_weight = scheme._canonicalize_packed_weight(qweight)
+    canonical_zero = scheme._canonicalize_packed_weight(qzeros)
+    actual = _dequantize_awq_unsigned_torch(
+        canonical_weight, scales, canonical_zero, group_size
     )
 
-    model_dir = os.environ.get("QUARK_AWQ_INT4_TEST_MODEL")
-    if model_dir is None:
-        pytest.skip("Set QUARK_AWQ_INT4_TEST_MODEL to run this checkpoint test")
-    weights_path = f"{model_dir}/model.safetensors"
-    if not os.path.isfile(weights_path):
-        pytest.skip(f"Quark AWQ INT4 checkpoint not found: {weights_path}")
-    weights = load_file(weights_path)
-    prefix = "model.layers.0.mlp.up_proj"
-    qweight = weights[f"{prefix}.weight"].cuda()
-    scales = weights[f"{prefix}.weight_scale"].cuda()
-    qzeros = weights[f"{prefix}.weight_zero_point"].cuda()
-
-    group_size = 128
-    expected = _dequantize_quark_signed_awq_torch(qweight, scales, qzeros, group_size)
-    unsigned = awq_dequantize_triton(qweight, scales, qzeros, signed_int4=False)
-    signed = awq_dequantize_triton(qweight, scales, qzeros, signed_int4=True)
-
-    cosine_unsigned = torch.nn.functional.cosine_similarity(
-        expected.flatten().float(), unsigned.flatten().float(), dim=0
-    )
-    assert cosine_unsigned < 0.5
-    torch.testing.assert_close(signed, expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual, expected)

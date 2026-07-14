@@ -256,7 +256,6 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
             w1_zp=layer.w13_weight_zero_point,
             w2_zp=layer.w2_weight_zero_point,
             block_shape=[0, layer.group_size],
-            signed_int4=True,
         )
 
     def apply(
@@ -296,6 +295,7 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
                 tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
             else:
                 tensor = tensor.view(-1, 8)
+            tensor = tensor ^ 0x8
             tensor = tensor.view(size0, -1)
 
             tensor = tensor.T.contiguous()

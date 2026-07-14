@@ -19,6 +19,8 @@ from vllm.model_executor.parameter import (
 class QuarkW4A16Int4(QuarkScheme):
     """Quark packed INT4 weight-only linear scheme."""
 
+    _AWQ_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+
     def __init__(self, group_size: int, pack_method: str):
         self.group_size = group_size
         self.pack_factor = 8
@@ -105,7 +107,36 @@ class QuarkW4A16Int4(QuarkScheme):
         layer.register_parameter("weight_zero_point", weight_zero_point)
         layer.register_parameter("weight_scale", weight_scale)
 
+    def _pack_order(self, device: torch.device) -> torch.Tensor:
+        if self.pack_reorder:
+            return torch.tensor(
+                self._AWQ_PACK_ORDER,
+                device=device,
+                dtype=torch.int32,
+            )
+        return torch.arange(self.pack_factor, device=device, dtype=torch.int32)
+
+    def _awq_pack_order(self, device: torch.device) -> torch.Tensor:
+        return torch.tensor(
+            self._AWQ_PACK_ORDER,
+            device=device,
+            dtype=torch.int32,
+        )
+
+    def _canonicalize_packed_weight(self, packed_weight: torch.Tensor) -> torch.Tensor:
+        source_shifts = self._pack_order(packed_weight.device) * 4
+        target_shifts = self._awq_pack_order(packed_weight.device) * 4
+
+        values = (packed_weight.to(torch.int32)[..., None] >> source_shifts) & 0xF
+        values = values ^ 0x8
+        packed = (values.to(torch.int64) << target_shifts.to(torch.int64)).sum(dim=-1)
+        return packed.to(torch.int32)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.weight.data = self._canonicalize_packed_weight(layer.weight.data)
+        layer.weight_zero_point.data = self._canonicalize_packed_weight(
+            layer.weight_zero_point.data
+        )
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         layer.weight_zero_point = torch.nn.Parameter(
             layer.weight_zero_point.data, requires_grad=False
@@ -132,27 +163,24 @@ class QuarkW4A16Int4(QuarkScheme):
 
         is_output_padded = output_size < qweight.shape[-1] * self.pack_factor
         if is_output_padded:
-            shifts = torch.arange(
-                0, self.pack_factor, device=qweight.device, dtype=torch.int32
-            )
-            if self.pack_reorder:
-                shifts = shifts.reshape(2, 4).T.reshape(-1)
-            shifts = shifts * 4
+            shifts = self._awq_pack_order(qweight.device) * 4
 
             weight = (qweight.to(torch.int32)[..., None] >> shifts) & 0xF
             weight = weight.reshape(qweight.shape[0], -1)[:, :output_size]
-            weight = torch.where(weight >= 8, weight - 16, weight)
 
             zeros = (qzeros.to(torch.int32)[..., None] >> shifts) & 0xF
             zeros = zeros.reshape(qzeros.shape[0], -1)[:, :output_size]
-            zeros = torch.where(zeros >= 8, zeros - 16, zeros)
             group_size = qweight.shape[0] // scales.shape[0]
             zeros = zeros.repeat_interleave(group_size, dim=0)
 
             scale = scales[:, :output_size].repeat_interleave(group_size, dim=0)
             weight = (weight - zeros).to(scale.dtype) * scale
             out = torch.matmul(reshaped_x, weight)
-        elif x.shape[:-1].numel() >= 256 or envs.VLLM_BATCH_INVARIANT:
+        elif (
+            x.dtype == torch.bfloat16
+            or x.shape[:-1].numel() >= 256
+            or envs.VLLM_BATCH_INVARIANT
+        ):
             out = ops.awq_dequantize(
                 qweight,
                 scales,
@@ -160,8 +188,6 @@ class QuarkW4A16Int4(QuarkScheme):
                 0,
                 0,
                 0,
-                signed_int4=True,
-                pack_reorder=self.pack_reorder,
             )
             out = torch.matmul(reshaped_x, out)
         else:
@@ -171,8 +197,6 @@ class QuarkW4A16Int4(QuarkScheme):
                 scales,
                 qzeros,
                 self.pack_factor,
-                signed_int4=True,
-                pack_reorder=self.pack_reorder,
             )
         if bias is not None:
             out[:, :output_size].add_(bias)
