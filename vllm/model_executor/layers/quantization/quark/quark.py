@@ -63,9 +63,6 @@ class QuarkConfig(QuantizationConfig):
         super().__init__()
         if kv_cache_group is None:
             kv_cache_group = []
-        quant_config["exclude"] = self._normalize_quark_excludes(
-            quant_config.get("exclude")
-        )
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
@@ -87,33 +84,17 @@ class QuarkConfig(QuantizationConfig):
         return weight_config.get("dtype") == "int4"
 
     @staticmethod
-    def _normalize_quark_excludes(exclude: list[str] | None) -> list[str] | None:
+    def _dedupe_quark_excludes(exclude: list[str] | None) -> list[str] | None:
         if not exclude:
             return exclude
 
         normalized: list[str] = []
         seen: set[str] = set()
 
-        def add(module_name: str) -> None:
+        for module_name in exclude:
             if module_name and module_name not in seen:
                 seen.add(module_name)
                 normalized.append(module_name)
-
-        for module_name in exclude:
-            candidates = {
-                module_name,
-                module_name.removeprefix("model.language_model."),
-                module_name.replace("model.language_model.", "model.", 1),
-            }
-            if module_name == "lm_head" or module_name.endswith(".lm_head"):
-                candidates.add("language_model.lm_head")
-            for candidate in tuple(candidates):
-                if candidate.endswith(".gate.linear"):
-                    candidates.add(candidate.removesuffix(".linear"))
-                elif candidate.endswith(".gate"):
-                    candidates.add(f"{candidate}.linear")
-            for candidate in candidates:
-                add(candidate)
 
         return normalized
 
@@ -189,7 +170,7 @@ class QuarkConfig(QuantizationConfig):
         for k, v in self.quant_config.items():
             quant_config_with_hf_to_vllm_mapper[k] = apply_value(v)
 
-        quant_config_with_hf_to_vllm_mapper["exclude"] = self._normalize_quark_excludes(
+        quant_config_with_hf_to_vllm_mapper["exclude"] = self._dedupe_quark_excludes(
             quant_config_with_hf_to_vllm_mapper.get("exclude")
         )
         self.quant_config = quant_config_with_hf_to_vllm_mapper

@@ -747,6 +747,10 @@ class TestQuarkInt4Format:
         quant_config = QuarkConfig.from_config(
             {
                 **_quark_int4_config(),
+                "exclude": [
+                    "model.language_model.layers.0.mlp.gate.linear",
+                    "lm_head",
+                ],
                 "layer_quant_config": {
                     "model.language_model.layers.0.mlp.gate.linear": {
                         "weight": {"dtype": "float16"},
@@ -755,12 +759,33 @@ class TestQuarkInt4Format:
             }
         )
         quant_config.apply_vllm_mapper(
-            WeightsMapper(orig_to_new_substr={".gate.linear": ".gate"})
+            WeightsMapper(
+                orig_to_new_prefix={
+                    "lm_head": "language_model.lm_head",
+                    "model.language_model.": "language_model.model.",
+                },
+                orig_to_new_substr={".gate.linear": ".gate"},
+            )
         )
 
         layer_quant_config = quant_config.quant_config["layer_quant_config"]
-        assert "model.language_model.layers.0.mlp.gate" in layer_quant_config
+        assert "language_model.model.layers.0.mlp.gate" in layer_quant_config
         assert "model.language_model.layers.0.mlp.gate.linear" not in layer_quant_config
+        assert quant_config.quant_config["exclude"] == [
+            "language_model.model.layers.0.mlp.gate",
+            "language_model.lm_head",
+        ]
+
+    def test_quark_config_does_not_expand_model_specific_excludes(self):
+        quant_config = QuarkConfig.from_config(
+            _quark_int4_config(
+                exclude=["model.language_model.layers.0.mlp.gate.linear"]
+            )
+        )
+
+        assert quant_config.quant_config["exclude"] == [
+            "model.language_model.layers.0.mlp.gate.linear"
+        ]
 
     def test_quark_mapper_renames_tensor_names(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config(symmetric=False))
