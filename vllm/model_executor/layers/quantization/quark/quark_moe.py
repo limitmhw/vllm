@@ -146,6 +146,7 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
         self.group_size = weight_config.get("group_size", 128)
         self.bit8_pack_factor = 2
         self.pack_reorder = pack_method == "reorder"
+        self.is_symmetric = weight_config.get("symmetric", True)
 
     def create_weights(
         self,
@@ -295,7 +296,8 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
                 tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
             else:
                 tensor = tensor.view(-1, 8)
-            tensor = tensor ^ 0x8
+            if self.is_symmetric:
+                tensor = tensor ^ 0x8
             tensor = tensor.view(size0, -1)
 
             tensor = tensor.T.contiguous()

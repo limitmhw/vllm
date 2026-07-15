@@ -21,10 +21,11 @@ class QuarkW4A16Int4(QuarkScheme):
 
     _AWQ_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 
-    def __init__(self, group_size: int, pack_method: str):
+    def __init__(self, group_size: int, pack_method: str, is_symmetric: bool):
         self.group_size = group_size
         self.pack_factor = 8
         self.pack_reorder = pack_method == "reorder"
+        self.is_symmetric = is_symmetric
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -128,7 +129,8 @@ class QuarkW4A16Int4(QuarkScheme):
         target_shifts = self._awq_pack_order(packed_weight.device) * 4
 
         values = (packed_weight.to(torch.int32)[..., None] >> source_shifts) & 0xF
-        values = values ^ 0x8
+        if self.is_symmetric:
+            values = values ^ 0x8
         packed = (values.to(torch.int64) << target_shifts.to(torch.int64)).sum(dim=-1)
         return packed.to(torch.int32)
 

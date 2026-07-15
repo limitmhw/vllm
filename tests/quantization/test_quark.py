@@ -607,6 +607,8 @@ def _dequantize_awq_unsigned_torch(
     scales: torch.Tensor,
     qzeros: torch.Tensor,
     group_size: int,
+    *,
+    pack_reorder: bool = True,
 ) -> torch.Tensor:
     bits = 4
     shifts = torch.arange(0, 32, bits, device=qweight.device)
@@ -615,7 +617,10 @@ def _dequantize_awq_unsigned_torch(
     zeros = ((qzeros[:, :, None] >> shifts[None, None, :]) & 0xF).to(torch.int8)
     zeros = zeros.view(qzeros.shape[0], -1)
 
-    order = torch.tensor(_REVERSE_AWQ_PACK_ORDER, device=qweight.device)
+    if pack_reorder:
+        order = torch.tensor(_REVERSE_AWQ_PACK_ORDER, device=qweight.device)
+    else:
+        order = torch.arange(8, device=qweight.device)
     iweights = iweights.view(qweight.shape[0], -1, 8)[:, :, order].reshape(
         qweight.shape[0], -1
     )
@@ -649,6 +654,15 @@ class TestQuarkInt4Format:
 
         assert isinstance(scheme, QuarkW4A16Int4)
         assert not scheme.pack_reorder
+
+    def test_quark_int4_scheme_supports_asymmetric_weights(self):
+        quant_config = QuarkConfig.from_config(_quark_int4_config(symmetric=False))
+        scheme = quant_config._get_scheme_from_config(
+            quant_config.quant_config["global_quant_config"]
+        )
+
+        assert isinstance(scheme, QuarkW4A16Int4)
+        assert not scheme.is_symmetric
 
     def test_quark_int4_moe_uses_native_moe_method(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config())
@@ -841,27 +855,39 @@ class TestQuarkInt4Format:
         assert "model.layers.0.mlp.down_proj.qqzeros" not in output_names
 
 
+@pytest.mark.parametrize("symmetric", [False, True])
 @pytest.mark.parametrize("pack_method", ["order", "reorder"])
-def test_quark_int4_canonicalizes_to_awq_unsigned_pack(pack_method):
-    """Quark signed INT4 tensors are adapted before shared AWQ kernels see them."""
+def test_quark_int4_canonicalizes_to_awq_unsigned_pack(pack_method, symmetric):
+    """Quark INT4 tensors are adapted before shared AWQ kernels see them."""
     pack_reorder = pack_method == "reorder"
     group_size = 2
-    signed_weight = torch.tensor(
+    packed_values = torch.tensor(
         [
             [0, 1, 7, 8, 9, 15, 2, 14],
             [15, 8, 0, 3, 12, 7, 1, 9],
         ],
         dtype=torch.int32,
     )
-    signed_zero = torch.zeros((1, 8), dtype=torch.int32)
-    qweight = _pack_int4_nibbles(signed_weight, pack_reorder=pack_reorder).view(2, 1)
-    qzeros = _pack_int4_nibbles(signed_zero, pack_reorder=pack_reorder).view(1, 1)
+    packed_zeros = torch.zeros((1, 8), dtype=torch.int32)
+    qweight = _pack_int4_nibbles(packed_values, pack_reorder=pack_reorder).view(2, 1)
+    qzeros = _pack_int4_nibbles(packed_zeros, pack_reorder=pack_reorder).view(1, 1)
     scales = torch.ones((1, 8), dtype=torch.float16)
 
-    expected = _dequantize_quark_signed_awq_torch(
-        qweight, scales, qzeros, group_size, pack_reorder=pack_reorder
+    dequantize = (
+        _dequantize_quark_signed_awq_torch
+        if symmetric
+        else _dequantize_awq_unsigned_torch
     )
-    scheme = QuarkW4A16Int4(group_size=group_size, pack_method=pack_method)
+    expected = dequantize(
+        qweight,
+        scales,
+        qzeros,
+        group_size,
+        pack_reorder=pack_reorder,
+    )
+    scheme = QuarkW4A16Int4(
+        group_size=group_size, pack_method=pack_method, is_symmetric=symmetric
+    )
     canonical_weight = scheme._canonicalize_packed_weight(qweight)
     canonical_zero = scheme._canonicalize_packed_weight(qzeros)
     actual = _dequantize_awq_unsigned_torch(

@@ -693,6 +693,7 @@ class QuarkConfig(QuantizationConfig):
             return QuarkW4A16Int4(
                 group_size=weight_config.get("group_size", 128),
                 pack_method=self.pack_method,
+                is_symmetric=weight_config.get("symmetric", True),
             )
         elif self._is_w4a8_mxfp4_fp8(weight_config, input_config):
             is_w4a8_supported = self._check_scheme_supported(
