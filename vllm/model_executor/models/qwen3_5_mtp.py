@@ -49,6 +49,16 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _get_mtp_lm_head_quant_config(quant_config):
+    if quant_config is None or quant_config.get_name() != "quark":
+        return quant_config
+
+    exclude = quant_config.quant_config.get("exclude", [])
+    if any(name == "lm_head" or name.endswith(".lm_head") for name in exclude):
+        return None
+    return quant_config
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -224,7 +234,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=self.quant_config,
+                    quant_config=_get_mtp_lm_head_quant_config(self.quant_config),
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
@@ -292,7 +302,9 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        return loader.load_weights(
+            remap_weight_names(weights), mapper=self.model.hf_to_vllm_mapper
+        )
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
