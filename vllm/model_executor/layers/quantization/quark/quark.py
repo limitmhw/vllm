@@ -81,28 +81,20 @@ class QuarkConfig(QuantizationConfig):
         if export_config.get("pack_method") not in ("order", "reorder"):
             return False
         weight_config = config.get("global_quant_config", {}).get("weight", {})
-        return weight_config.get("dtype") in ("int4", "uint4")
+        return weight_config.get("dtype") == "int4"
 
     @staticmethod
     def _dedupe_quark_excludes(exclude: list[str] | None) -> list[str] | None:
         if not exclude:
             return exclude
 
-        import fnmatch as _fnmatch
         normalized: list[str] = []
         seen: set[str] = set()
 
         for module_name in exclude:
-            if not module_name or module_name in seen:
-                continue
-            seen.add(module_name)
-            # should_ignore_layer only supports exact match or re:-prefixed regex.
-            # Quark config uses fnmatch-style wildcards (* and ?). Convert them.
-            if not module_name.startswith("re:") and (
-                "*" in module_name or "?" in module_name
-            ):
-                module_name = "re:" + _fnmatch.translate(module_name)
-            normalized.append(module_name)
+            if module_name and module_name not in seen:
+                seen.add(module_name)
+                normalized.append(module_name)
 
         return normalized
 
@@ -424,7 +416,7 @@ class QuarkConfig(QuantizationConfig):
         if weight_quant is None or input_quant is not None:
             return False
 
-        is_int4 = weight_quant.get("dtype") in ("int4", "uint4")
+        is_int4 = weight_quant.get("dtype") == "int4"
         is_grouped = weight_quant.get("qscheme", "per_group") == "per_group"
         is_static = not weight_quant.get("is_dynamic")
         is_packed = self.pack_method in ("order", "reorder")
