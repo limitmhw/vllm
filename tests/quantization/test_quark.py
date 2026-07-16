@@ -31,10 +31,10 @@ from vllm.model_executor.layers.quantization.quark.schemes import QuarkW4A16Int4
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
-from vllm.model_executor.models.qwen3_5_mtp import (
-    _get_mtp_lm_head_quant_config,
+from vllm.model_executor.models.utils import (
+    WeightsMapper,
+    get_aux_lm_head_quant_config,
 )
-from vllm.model_executor.models.utils import WeightsMapper
 from vllm.platforms import current_platform
 
 if current_platform.is_rocm():
@@ -857,22 +857,22 @@ class TestQuarkInt4Format:
         assert "model.layers.0.mlp.down_proj.qscales" not in output_names
         assert "model.layers.0.mlp.down_proj.qqzeros" not in output_names
 
-    def test_quark_mtp_lm_head_respects_exclude(self):
+    def test_aux_lm_head_respects_lm_head_exclude(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config(exclude=["lm_head"]))
 
-        assert _get_mtp_lm_head_quant_config(quant_config) is None
+        assert get_aux_lm_head_quant_config(quant_config) is None
 
-    def test_quark_mtp_lm_head_respects_mapped_exclude(self):
+    def test_aux_lm_head_respects_mapped_lm_head_exclude(self):
         quant_config = QuarkConfig.from_config(
             _quark_int4_config(exclude=["language_model.lm_head"])
         )
 
-        assert _get_mtp_lm_head_quant_config(quant_config) is None
+        assert get_aux_lm_head_quant_config(quant_config) is None
 
-    def test_quark_mtp_lm_head_uses_quant_config_when_not_excluded(self):
+    def test_aux_lm_head_uses_quant_config_when_not_excluded(self):
         quant_config = QuarkConfig.from_config(_quark_int4_config())
 
-        assert _get_mtp_lm_head_quant_config(quant_config) is quant_config
+        assert get_aux_lm_head_quant_config(quant_config) is quant_config
 
 
 @pytest.mark.parametrize("symmetric", [False, True])

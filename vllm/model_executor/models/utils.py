@@ -5,6 +5,7 @@ import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, overload
 
 import regex as re
@@ -38,6 +39,46 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 ShardId: TypeAlias = str | int | tuple[int, ...]
+
+
+def get_aux_lm_head_quant_config(
+    quant_config: "QuantizationConfig | None",
+) -> "QuantizationConfig | None":
+    """Return quant config for an auxiliary LM head.
+
+    Auxiliary heads, such as MTP/speculative heads, should follow the main
+    ``lm_head`` quantization policy. If the checkpoint explicitly excludes the
+    main ``lm_head`` from quantization, keep the auxiliary head unquantized too.
+    """
+    if quant_config is None:
+        return None
+
+    excluded_layers: list[str] = []
+    config = getattr(quant_config, "quant_config", None)
+    if isinstance(config, dict):
+        for key in ("exclude", "ignored_layers", "modules_to_not_convert"):
+            excluded_layers.extend(config.get(key, []) or [])
+
+    for attr in ("ignored_layers", "ignore", "modules_to_not_convert"):
+        excluded_layers.extend(getattr(quant_config, attr, None) or [])
+
+    def excludes_lm_head(name: str) -> bool:
+        if name.startswith("re:"):
+            pattern = name.removeprefix("re:")
+            return re.fullmatch(pattern, "lm_head") is not None or re.fullmatch(
+                pattern, "language_model.lm_head"
+            ) is not None
+        if "*" in name or "?" in name:
+            return fnmatchcase("lm_head", name) or fnmatchcase(
+                "language_model.lm_head", name
+            )
+        return name == "lm_head" or name.endswith(".lm_head")
+
+    if any(
+        excludes_lm_head(name) for name in excluded_layers if isinstance(name, str)
+    ):
+        return None
+    return quant_config
 
 
 @dataclass

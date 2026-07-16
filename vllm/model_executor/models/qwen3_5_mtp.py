@@ -41,22 +41,13 @@ from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
+    get_aux_lm_head_quant_config,
     _merge_multimodal_embeddings,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
 
 logger = init_logger(__name__)
-
-
-def _get_mtp_lm_head_quant_config(quant_config):
-    if quant_config is None or quant_config.get_name() != "quark":
-        return quant_config
-
-    exclude = quant_config.quant_config.get("exclude", [])
-    if any(name == "lm_head" or name.endswith(".lm_head") for name in exclude):
-        return None
-    return quant_config
 
 
 @support_torch_compile(
@@ -234,7 +225,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=_get_mtp_lm_head_quant_config(self.quant_config),
+                    quant_config=get_aux_lm_head_quant_config(self.quant_config),
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
