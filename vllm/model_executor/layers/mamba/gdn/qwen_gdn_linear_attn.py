@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
+from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -628,7 +629,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return (
             current_platform.is_cuda()
             and not self.gqa_interleaved_layout
-            and isinstance(quant_config, (AutoAWQConfig, AutoGPTQConfig, INCConfig))
+            and isinstance(quant_config, (AutoAWQConfig, AutoGPTQConfig, INCConfig,
+                                          QuarkConfig))
         )
 
     def split_ba(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
