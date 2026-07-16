@@ -874,6 +874,49 @@ class TestQuarkInt4Format:
 
         assert _get_mtp_lm_head_quant_config(quant_config) is quant_config
 
+    def test_quark_uint4_is_packed_int4_export(self):
+        """uint4 asymmetric exports must be detected as packed INT4."""
+        config = _quark_int4_config()
+        config["global_quant_config"]["weight"]["dtype"] = "uint4"
+        config["global_quant_config"]["weight"]["symmetric"] = False
+        assert QuarkConfig._is_packed_int4_export(config)
+
+    def test_quark_uint4_selects_w4a16_scheme(self):
+        """uint4 asymmetric config must route to QuarkW4A16Int4 scheme."""
+        config = _quark_int4_config(symmetric=False)
+        config["global_quant_config"]["weight"]["dtype"] = "uint4"
+        quant_config = QuarkConfig.from_config(config)
+        scheme = quant_config._get_scheme_from_config(
+            quant_config.quant_config["global_quant_config"]
+        )
+        assert isinstance(scheme, QuarkW4A16Int4)
+        assert not scheme.is_symmetric
+
+    def test_quark_exclude_wildcard_is_matched(self):
+        """fnmatch wildcards in exclude list must be converted to re: patterns
+        so that should_ignore_layer correctly skips the listed layers."""
+        from vllm.model_executor.layers.quantization.quark.utils import (
+            should_ignore_layer,
+        )
+
+        raw_patterns = ["*mlp.gate", "*.shared_expert.*"]
+        # _dedupe_quark_excludes converts fnmatch wildcards to re: patterns.
+        converted = QuarkConfig._dedupe_quark_excludes(raw_patterns)
+        assert converted is not None
+
+        # Wildcard patterns should have been converted to re: regexes.
+        assert any(e.startswith("re:") for e in converted)
+
+        # The converted patterns must match the expected layer names.
+        gate = "model.language_model.layers.0.mlp.gate"
+        shared = "model.language_model.layers.0.mlp.shared_expert.gate_proj"
+        assert should_ignore_layer(gate, ignore=converted, fused_mapping={})
+        assert should_ignore_layer(shared, ignore=converted, fused_mapping={})
+
+        # Non-excluded layers must not be matched.
+        experts = "model.language_model.layers.0.mlp.experts.0.gate_proj"
+        assert not should_ignore_layer(experts, ignore=converted, fused_mapping={})
+
 
 @pytest.mark.parametrize("symmetric", [False, True])
 @pytest.mark.parametrize("pack_method", ["order", "reorder"])
